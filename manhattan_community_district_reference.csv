@@ -1,0 +1,13 @@
+community_board,district_name,neighborhood,planning_area,total_units,residential_units
+1,Manhattan Community Board 1,Financial District / Tribeca / Civic Center,Lower Manhattan,59201,47267
+2,Manhattan Community Board 2,Greenwich Village / SoHo / NoHo / Little Italy,Lower Manhattan,72751,61370
+3,Manhattan Community Board 3,Lower East Side / Chinatown,Lower Manhattan,94149,83639
+4,Manhattan Community Board 4,Clinton / Hell's Kitchen / Chelsea,Midtown,102014,88333
+5,Manhattan Community Board 5,Midtown / Flatiron / Gramercy,Midtown,92470,45878
+6,Manhattan Community Board 6,Stuyvesant Town / Kips Bay / Murray Hill,Midtown,114930,103972
+7,Manhattan Community Board 7,Upper West Side / Manhattan Valley,Upper Manhattan,134534,128248
+8,Manhattan Community Board 8,Upper East Side / Yorkville / Lenox Hill,Upper Manhattan,159953,151425
+9,Manhattan Community Board 9,Morningside Heights / West Harlem,Upper Manhattan,49323,46846
+10,Manhattan Community Board 10,Central Harlem,Upper Manhattan,65710,61902
+11,Manhattan Community Board 11,East Harlem,Upper Manhattan,62798,59729
+12,Manhattan Community Board 12,Washington Heights / Inwood / Marble Hill,Upper Manhattan,79412,75860
