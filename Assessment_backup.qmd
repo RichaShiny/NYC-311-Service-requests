@@ -1,0 +1,549 @@
+---
+title: "CUNY ISLG Data Skills Assessment – 311 Service Requests"
+author: "Richa Shiny Tigiripally"
+date: today
+format:
+  html:
+    
+    toc: true
+    toc-float: true
+    theme: darkly
+    highlight-style: tango
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show code"
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: 
+  markdown: 
+    wrap: sentence
+---
+
+![](images/CUNYISLG.png)
+
+```{r}
+
+#| label: libraries
+#| message: false
+#| warning: false
+
+# These are the packages we need for this analysis
+# tidyverse = data manipulation and visualization
+# httr = making API calls to NYC Open Data
+# scales = formatting numbers as percentages
+# knitr = making nice tables in the output
+
+library(tidyverse)
+library(httr)
+library(scales)
+library(knitr)
+```
+
+# Part 1: Data Preparation
+
+## Task 1A: Export 311 Data
+
+I pulled the 311 data programmatically from the NYC Open Data Socrata API rather than exporting manually.
+This makes the pipeline fully reproducible — anyone running this notebook will pull the same data from the same source without needing a local file.
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: pull-311-data
+#| cache: true
+
+# The NYC Open Data API endpoint for 311 service requests
+# We use the .csv format so we can read it directly into R with read_csv
+base_url <- "https://data.cityofnewyork.us/resource/erm2-nwe9.csv"
+
+# Build the query URL with three filters applied server-side:
+# 1. borough = MANHATTAN (scope to Manhattan only)
+# 2. created_date >= Jan 1 2024 (start of Q1)
+# 3. created_date <= Mar 31 2024 (end of Q1)
+# $limit=200000 overrides the default 1000-row cap from the API
+query <- paste0(
+  base_url,
+  "?$where=",
+  URLencode("borough='MANHATTAN' AND created_date >= '2024-01-01T00:00:00' AND created_date <= '2024-03-31T23:59:59'"),
+  "&$limit=200000"
+)
+
+# Make the HTTP GET request to the API
+response <- httr::GET(query)
+
+# Extract the raw text content from the response
+raw_text <- httr::content(response, as = "text", encoding = "UTF-8")
+
+# Parse the CSV text into a dataframe
+df_311_raw <- read_csv(raw_text, show_col_types = FALSE)
+
+# Print how many rows and columns we got back
+cat("Total rows pulled:", nrow(df_311_raw), "\n")
+cat("Total columns:", ncol(df_311_raw), "\n")
+```
+
+```{r}
+
+#| label: save-data
+#| echo: true
+#| message: false
+#| warning: false
+
+# Save the raw 311 data pulled from the API as a CSV
+# This is included with the submission as required by the exercise instructions
+write_csv(df_311_raw, "311_manhattan_q1_2024.csv")
+
+cat("311 data saved as 311_manhattan_q1_2024.csv\n")
+cat("Rows:", nrow(df_311_raw), "\n")
+cat("Columns:", ncol(df_311_raw), "\n")
+```
+
+**Response to Task 1A:** 
+After filtering to Manhattan and Q1 2024 (January 1 through March 31), the dataset contains 165,894 rows. Each row represents one 311 service request. The data was pulled programmatically via the NYC Open Data Socrata API with filters applied server-side.
+
+## Task 1B: Prepare to Join
+
+Before joining, we need to understand what the join key looks like in both datasets.
+The reference table uses integers 1–12 for community districts.
+The 311 data stores community_board as a string that needs cleaning.
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: load-reference
+
+# Pull the community district reference CSV directly from GitHub
+# This avoids needing a local copy of the file
+cd_ref <- read_csv("manhattan_community_district_reference.csv",
+                   show_col_types = FALSE) %>%
+# We rename community_board to cd_numeric for two reasons:
+# 1. The reference table's community_board is already clean integers (1-12)
+# 2. The 311 community_board field is messy strings ("01", "0", "Unspecified").
+# So we will clean the 311 side into a new column also called cd_numeric. Renaming both sides to the same name (cd_numeric) makes the join keyexplicit and shows the cleaning was intentional before joining
+  rename(cd_numeric = community_board)
+
+# Print the reference table to confirm it loaded correctly
+kable(cd_ref, caption = "Community District Reference Table")
+```
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: inspect-311-join-key
+
+# Before we can join, we need to understand what the community_board
+# field looks like in the 311 data
+# It is stored as a string and may have unexpected values
+
+# Extract the trailing numeric portion from the community_board string
+# For example "01" becomes 1, "12" becomes 12
+# Values like "0" or "Unspecified" will become NA or 0
+df_311 <- df_311_raw %>%
+  mutate(
+    # str_extract pulls the number at the end of the string
+    # as.integer converts it from string to number
+    cd_numeric = suppressWarnings(as.integer(str_extract(community_board, "\\d+$"))),
+    
+    # Flag whether this record has a valid Manhattan CD (1 through 12)
+    # Records outside this range cannot be matched to the reference table
+    cd_valid = !is.na(cd_numeric) & cd_numeric >= 1 & cd_numeric <= 12
+  )
+
+# Show the most common community_board values so we can see
+# what we are working with before joining
+df_311 %>%
+  count(community_board, cd_numeric, cd_valid, sort = TRUE) %>%
+  head(20) %>%
+  kable(caption = "Top community_board values in 311 data before joining")
+```
+
+**Response to Task 1B:** 
+The join key is community_board, matched from the 311 data to the community_board field in the reference table (renamed to cd_numeric on both sides for clarity).
+Before joining, inspection of the 311 community_board field revealed that values are stored as strings in the format "12 MANHATTAN", "07 MANHATTAN", etc., with the borough name appended after the district number.
+This means a direct string match against the reference table's integer values (1-12) would fail entirely.
+Additional unexpected values include "Unspecified MANHATTAN" for requests that were not geocoded to a specific district, and a small number of records like "08 BRONX" that passed the borough filter but belong to another borough.
+To prepare for the join, I extracted the leading numeric portion from the 311 community_board string using a regex pattern (\^\\d+), cast it to integer, and validate that the result falls within the 1-12 range of Manhattan community districts.
+Records outside this range are retained in the dataset but will not match the reference table and are diagnosed in Task 2B.
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: fix-311-join-key
+
+# Now that we know the format is "07 MANHATTAN" we extract from the START
+# of the string using ^\\d+ which means "digits at the beginning"
+# This correctly pulls 7 from "07 MANHATTAN", 12 from "12 MANHATTAN" etc.
+df_311 <- df_311_raw %>%
+  mutate(
+    # Extract leading digits and convert to integer
+    cd_numeric = suppressWarnings(as.integer(str_extract(community_board, "^\\d+"))),
+    
+    # Flag valid Manhattan CDs only (1 through 12)
+    # Anything outside this range will not match the reference table
+    cd_valid = !is.na(cd_numeric) & cd_numeric >= 1 & cd_numeric <= 12
+  )
+
+# Check the distribution again after the fix
+df_311 %>%
+  count(community_board, cd_numeric, cd_valid, sort = TRUE) %>%
+  head(20) %>%
+  kable(caption = "community_board values after cleaning")
+```
+
+# Part 2: Join
+
+## Task 2A: Perform the Join
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: join
+
+# Perform a LEFT JOIN from the 311 data to the reference table
+# We use a left join because we want to keep ALL 311 records
+# including ones that do not match a community district
+# An inner join would silently drop unmatched records
+# A right join would drop unmatched 311 records entirely
+df_joined <- df_311 %>%
+  left_join(cd_ref, by = "cd_numeric")
+
+# Confirm row count matches original
+# A left join should never add or drop rows
+cat("Rows before join:", nrow(df_311), "\n")
+cat("Rows after join:", nrow(df_joined), "\n")
+cat("Rows match:", nrow(df_311) == nrow(df_joined), "\n")
+
+# Preview the joined dataset
+df_joined %>%
+  select(unique_key, community_board, cd_numeric, cd_valid,
+         neighborhood, planning_area, complaint_type) %>%
+  head(10) %>%
+  kable(caption = "Sample rows from joined dataset")
+```
+
+**Response to Task 2A:** After joining, the dataset has 165,894 rows, identical to the pre-join count, which is exactly what a left join should produce. Each row still represents one 311 service request, now enriched with neighborhood and planning area where a match was found. I used a left join to retain all 311 records including unmatched ones. An inner join would have silently dropped ungeocoded records. A right join would have dropped unmatched 311 records entirely.
+
+## Task 2B: Diagnose Non-Matches
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: non-matches
+
+# Non-matches are rows where planning_area is NA after the join
+# These are records that could not be matched to a community district
+non_matches <- df_joined %>%
+  filter(is.na(planning_area))
+
+cat("Total non-matching records:", nrow(non_matches), "\n")
+cat("Share of total:", scales::percent(nrow(non_matches) / nrow(df_joined), 0.1), "\n")
+
+# What community_board values do the non-matches have?
+# This tells us WHY they did not match
+non_matches %>%
+  count(community_board, cd_numeric, sort = TRUE) %>%
+  kable(caption = "community_board values among non-matching records")
+```
+
+**Response to Task 2B:** After joining, 3,898 records (2.3% of the dataset) did not match a row in the reference table. These non-matches fall into two categories:
+
+"Unspecified MANHATTAN" (3,530 records): Requests that were submitted but not geocoded to a specific community district. This is common for complaints called in by phone before an address is fully verified, or for requests where the location could not be resolved to a specific district at intake.
+"64 MANHATTAN" (368 records): Records with a community board value of 64, which falls outside the 1-12 range of Manhattan community districts. This appears to be a data entry or coding anomaly in the source system, as Manhattan only has 12 community districts.
+
+These records are retained in df_joined but excluded from the neighborhood-level analysis in Part 3, since they cannot be reliably assigned to a specific community board. I would not attempt to impute a community district from address fields without additional validation. The risk of misassignment outweighs the benefit given that non-matches represent only 2.3% of total records.
+
+
+# Part 3: Filter to heating and hot water complaints
+
+## Task 3: HPD Heating and Hot Water Grant Recommendation
+
+```{r}
+
+# The task asks us to identify 311 calls related to heating or hot water
+# We use the complaint_type field and search for "HEAT" or "HOT WATER"
+# toupper() makes the match case-insensitive so we catch all variations
+# We exclude non-matched records (planning_area is NA) because we need
+# to assign complaints to specific community boards for the recommendation
+
+df_heat <- df_joined %>%
+  filter(
+    str_detect(toupper(complaint_type), "HEAT|HOT WATER"),
+    !is.na(planning_area)
+  )
+
+cat("Total heat/hot water complaints:", nrow(df_heat), "\n")
+
+# Show which complaint_type values were captured
+# This is the answer to "which values did you use?" in Task 3
+df_heat %>%
+  count(complaint_type, sort = TRUE) %>%
+  kable(caption = "Complaint types identified as heat or hot water related")
+```
+
+```{r}
+
+
+# Count complaints by planning area to determine which area has the greatest need
+# This answers "which planning area?" in Task 3
+df_heat %>%
+  count(planning_area, sort = TRUE) %>%
+  mutate(pct = scales::percent(n / sum(n), 0.1)) %>%
+  kable(caption = "Heat and hot water complaints by planning area")
+```
+
+```{r}
+
+#| label: by-cd-normalized
+#| echo: true
+#| message: false
+#| warning: false
+
+# Count complaints by planning area and community board
+# Then normalize by residential units to account for differences in
+# housing density across districts
+# Raw counts alone would favor larger districts simply because they have
+# more housing units, not because conditions are worse
+df_heat %>%
+  count(planning_area, cd_numeric, neighborhood) %>%
+  left_join(cd_ref %>% select(cd_numeric, residential_units), by = "cd_numeric") %>%
+  mutate(
+    # Complaints per 1000 residential units gives a fair comparison
+    # across districts of different sizes
+    per_1000 = round(n / residential_units * 1000, 1)
+  ) %>%
+  arrange(planning_area, desc(per_1000)) %>%
+  kable(caption = "Heat and hot water complaints per 1,000 residential units by community board")
+```
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: chart
+#| echo: true
+#| fig-width: 9
+#| fig-height: 5
+
+# Bar chart showing complaints per 1,000 residential units by community board
+# Colored by planning area so the pattern is immediately visible
+df_heat %>%
+  count(planning_area, cd_numeric, neighborhood) %>%
+  left_join(cd_ref %>% select(cd_numeric, residential_units), by = "cd_numeric") %>%
+  mutate(
+    per_1000 = round(n / residential_units * 1000, 1),
+    neighborhood = fct_reorder(neighborhood, per_1000)
+  ) %>%
+  ggplot(aes(x = per_1000, y = neighborhood, fill = planning_area)) +
+  geom_col() +
+  geom_text(aes(label = per_1000), hjust = -0.2, size = 3) +
+  scale_fill_manual(values = c(
+    "Lower Manhattan" = "#2c7bb6",
+    "Midtown"         = "#abd9e9",
+    "Upper Manhattan" = "#d7191c"
+  )) +
+  labs(
+    title   = "Heating and Hot Water 311 Complaints per 1,000 Residential Units",
+    subtitle = "Manhattan Community Districts, Q1 2024",
+    x       = "Complaints per 1,000 residential units",
+    y       = NULL,
+    fill    = "Planning Area",
+    caption = "Source: NYC 311 Open Data, Q1 2024"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+**Response to Part 3:**
+
+**Which service calls?** I identified complaints using the "complaint_type" field, filtering for values containing "HEAT" or "HOT WATER." This captured two types: HEAT/HOT WATER (23,338 records) and Non-Residential Heat (109 records), totaling 23,447 complaints.
+
+**Which planning area?** I recommend Upper Manhattan. It accounts for 18,691 complaints, or 79.7% of all heat and hot water complaints in Manhattan during Q1 2024. This concentration holds when normalized by residential units, with Upper Manhattan districts occupying the top four spots citywide.
+
+**Which community boards?** Within Upper Manhattan, I recommend targeting Community Board 12 (Washington Heights / Inwood / Marble Hill) at 87.5 complaints per 1,000 residential units, the highest rate in Manhattan, and Community Board 10 (Central Harlem) at 70.3 complaints per 1,000 residential units, the second highest rate overall.
+
+**Limitations:** 311 data measures reporting, not the underlying prevalence of heating problems. Communities with lower 311 engagement due to language barriers or distrust of city systems may appear to have fewer complaints even if conditions are equally poor. This analysis is limited to Q1 2024, which captures the peak heating season and may not reflect conditions year-round. Residential unit counts used for normalization are static reference figures and may not reflect current occupancy. Approximately 2.3% of records
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: chart-heatmap
+#| echo: true
+#| fig-width: 9
+#| fig-height: 5
+
+# Chart 2: Heatmap of complaints by community board and month
+# This shows both WHICH districts have the most complaints
+# AND whether the problem is consistent across all three months
+# or concentrated in a single cold snap
+
+df_heat %>%
+  mutate(month = lubridate::month(created_date, label = TRUE)) %>%
+  count(neighborhood, month) %>%
+  mutate(neighborhood = fct_reorder(neighborhood, n, sum)) %>%
+  ggplot(aes(x = month, y = neighborhood, fill = n)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = scales::comma(n)), size = 3) +
+  scale_fill_gradient(low = "#fff5f0", high = "#d7191c", labels = scales::comma) +
+  labs(
+    title    = "Heating and Hot Water Complaints by Community Board and Month",
+    subtitle = "Manhattan, Q1 2024",
+    x        = NULL,
+    y        = NULL,
+    fill     = "Complaints",
+    caption  = "Source: NYC 311 Open Data, Q1 2024"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+The heatmap confirms that heating complaints in Upper Manhattan are not a one-month spike but a persistent pattern across all three months of Q1 2024. Washington Heights/Inwood/Marble Hill and Central Harlem show consistently high complaint volumes in January, February, and March, suggesting a structural heating maintenance problem rather than a weather-driven anomaly.
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: chart-monthly-trend
+#| echo: true
+#| fig-width: 9
+#| fig-height: 5
+
+# Chart 3: Monthly trend of heat complaints by planning area
+# Shows whether complaints are concentrated in January (coldest month)
+# or spread across the quarter
+# This gives HPD context on when outreach would be most impactful
+
+df_heat %>%
+  mutate(month = lubridate::month(created_date, label = TRUE)) %>%
+  count(month, planning_area) %>%
+  ggplot(aes(x = month, y = n, color = planning_area, group = planning_area)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(aes(label = scales::comma(n)), vjust = -0.8, size = 3) +
+  scale_color_manual(values = c(
+    "Lower Manhattan" = "#2c7bb6",
+    "Midtown"         = "#abd9e9",
+    "Upper Manhattan" = "#d7191c"
+  )) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Monthly Heating and Hot Water Complaints by Planning Area",
+    subtitle = "Manhattan, Q1 2024",
+    x        = "Month",
+    y        = "Number of complaints",
+    color    = "Planning Area",
+    caption  = "Source: NYC 311 Open Data, Q1 2024"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+Complaints peak in January across all three planning areas and decline through March as temperatures rise. Upper Manhattan accounts for the vast majority of complaints in every month, reinforcing that the geographic concentration is stable and not driven by a single cold event. The relatively flat lines for Midtown and Lower Manhattan suggest those areas have fewer systemic heating issues.
+
+```{r}
+
+#| message: false
+#| warning: false
+#| label: chart-agency
+#| echo: true
+#| fig-width: 9
+#| fig-height: 5
+
+# Chart 4: Which agencies are handling heat complaints in Upper Manhattan
+# Since we are advising HPD specifically, this shows what share of
+# heat complaints in our recommended area are already in HPD's purview
+# versus other agencies
+
+df_heat %>%
+  filter(planning_area == "Upper Manhattan") %>%
+  count(agency_name, sort = TRUE) %>%
+  head(5) %>%
+  mutate(agency_name = fct_reorder(agency_name, n)) %>%
+  ggplot(aes(x = n, y = agency_name)) +
+  geom_col(fill = "#d7191c") +
+  geom_text(aes(label = scales::comma(n)), hjust = -0.2, size = 3) +
+  scale_x_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Agencies Handling Heat and Hot Water Complaints in Upper Manhattan",
+    subtitle = "Top 5 agencies, Q1 2024",
+    x        = "Number of complaints",
+    y        = NULL,
+    caption  = "Source: NYC 311 Open Data, Q1 2024"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+The Department of Housing Preservation and Development handles the overwhelming majority of heat and hot water complaints in Upper Manhattan, confirming that HPD is already the primary agency receiving and responding to these issues. This makes HPD the natural home for a tenant outreach grant targeting this area.
+
+```{r}
+
+#| label: chart-map
+#| echo: true
+#| message: false
+#| warning: false
+
+library(leaflet)
+
+# Approximate lat/lon centroids for each Manhattan community board
+# These are used to position the bubbles on the map
+cd_coords <- tibble(
+  cd_numeric = 1:12,
+  lat = c(40.714, 40.730, 40.715, 40.753, 40.745, 40.744,
+          40.784, 40.774, 40.811, 40.818, 40.796, 40.851),
+  lon = c(-74.008, -74.002, -73.991, -74.002, -73.986, -73.973,
+          -73.981, -73.957, -73.954, -73.938, -73.938, -73.937)
+)
+
+# Join complaint counts and normalized rates to the coordinates
+map_data <- df_heat %>%
+  count(cd_numeric, neighborhood, planning_area) %>%
+  left_join(cd_ref %>% select(cd_numeric, residential_units), by = "cd_numeric") %>%
+  mutate(per_1000 = round(n / residential_units * 1000, 1)) %>%
+  left_join(cd_coords, by = "cd_numeric")
+
+# Color palette by planning area
+pal <- colorFactor(
+  palette = c("#2c7bb6", "#abd9e9", "#d7191c"),
+  levels  = c("Lower Manhattan", "Midtown", "Upper Manhattan")
+)
+
+# Build the interactive bubble map
+# Bubble size = raw complaint count
+# Bubble color = planning area
+# Popup shows neighborhood name, raw count, and rate per 1,000 units
+leaflet(map_data) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    lng    = ~lon,
+    lat    = ~lat,
+    radius = ~sqrt(n) / 3,
+    color  = ~pal(planning_area),
+    fillColor = ~pal(planning_area),
+    fillOpacity = 0.7,
+    stroke = TRUE,
+    weight = 1.5,
+    popup  = ~paste0(
+      "<b>", neighborhood, "</b><br>",
+      "Planning Area: ", planning_area, "<br>",
+      "Total complaints: ", scales::comma(n), "<br>",
+      "Per 1,000 units: ", per_1000
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal      = pal,
+    values   = ~planning_area,
+    title    = "Planning Area"
+  )
+```
+
+
+The bubble map shows the geographic distribution of heat and hot water complaints across Manhattan community boards. Bubble size reflects raw complaint volume and color indicates planning area. The concentration of large red bubbles in Upper Manhattan, particularly in the northern neighborhoods, visually reinforces the case for targeting that area.
